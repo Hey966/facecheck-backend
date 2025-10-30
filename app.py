@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-進階班 LINE 推播後端（Flask + Google 試算表，完整檔案版＋診斷強化）
+進階班 LINE 推播後端（Flask + Google 試算表，完整檔案版）
 
 功能：
 - Webhook：處理「連結 <姓名>」→ 寫入 users 工作表（或本地 users.json）
@@ -8,21 +8,30 @@
 - POST /checkin：本機回報簽到（X-API-KEY），後端判斷當日去重與遲到，再推播
 - POST /cron/morning_scan：平日 08:00 未簽到提醒（X-API-KEY）
 - GET /push?name=...&text=...：測試推播
-- GET /debug/sheets：檢查 Google 試算表連線/分頁狀態（含服務帳戶健檢）
+- GET /debug/sheets：檢查 Google 試算表連線/讀取狀態（含服務帳戶健檢）
 - GET /debug/sheets/write：實際寫入一列驗證「可寫入」
-- GET /webhook：診斷路由是否存在（LINE 仍走 POST）
+- GET /debug/sheets/diag：分步診斷（LOAD_SA / OPEN / WRITE）
+- GET /admin/unchecked_preview：僅預覽今天未簽到名單（不寫資料）
 - GET /health：健康檢查
 
 需求套件：
 Flask, line-bot-sdk (v3), gspread, google-auth, python-dotenv, requests
+
+必要環境變數：
+CHANNEL_ACCESS_TOKEN, CHANNEL_SECRET
+可選（啟用 Sheets 模式，擇一或多個來源）：
+GOOGLE_SERVICE_ACCOUNT_JSON / GOOGLE_SERVICE_ACCOUNT_FILE / GOOGLE_SERVICE_ACCOUNT_B64
+（支援舊名：SERVICE_ACCOUNT_JSON_B64）
+另需：GOOGLE_SHEET_ID（支援舊名：SHEET_ID）
+其他：
+API_KEY, TZ=Asia/Taipei, LATE_CUTOFF=08:00, ONLY_WEEKDAYS=1
+START_NGROK=1（僅本機開發）
 """
 
 import os, json, atexit, subprocess, time, requests, shutil, datetime, base64
 from pathlib import Path
 from urllib.parse import urljoin
 from flask import Flask, request, jsonify
-
-print("[BOOT] facecheck-backend FULL + diagnostics (GET /webhook, route listing)")
 
 # ---------- 以此檔所在資料夾為工作目錄 ----------
 BASE_DIR = Path(__file__).resolve().parent
@@ -198,7 +207,7 @@ def _fs_save_users(data):
     except Exception as e:
         print("[USERS][ERROR] 寫入失敗", e); return False
 
-# ---------- Google Sheets 介面（多來源載入 + 鍵值健檢 + 自動修復換行 + 舊名相容） ----------
+# ---------- Google Sheets 介面（多來源載入 + 健檢 + 舊名相容） ----------
 USE_SHEETS = False
 _gs_reason = None
 _sa_info_cache = None
@@ -440,59 +449,178 @@ def line_push(user_id, text):
             PushMessageRequest(to=user_id, messages=[TextMessage(text=text)])
         )
 
-# ---------- Routes ----------
-@app.get("/")
-def home():
-    return jsonify({"status":"ok","service":"facecheck-backend","tz":TZ_NAME,"sheets":USE_SHEETS}), 200
+# ---------- Debug：分步診斷 / 讀寫驗證 ----------
+def _check_sheet_access():
+    """
+    分步診斷 Google Sheet 開啟/寫入權限。
+    回傳 dict：包含每一步結果、清楚的 HINT，以及捕捉到的例外型別/訊息。
+    """
+    info = {
+        "tz": TZ_NAME,
+        "env": {
+            "USE_SHEETS": USE_SHEETS,
+            "GOOGLE_SHEET_ID": (os.environ.get("GOOGLE_SHEET_ID") or os.environ.get("SHEET_ID") or ""),
+        },
+        "service_account": {},
+        "steps": [],
+        "ok": False,
+    }
+    try:
+        if not USE_SHEETS:
+            info["steps"].append({"step": "ENV", "ok": False, "detail": "USE_SHEETS=False",
+                                  "hint": "請設定 GOOGLE_SERVICE_ACCOUNT_* 與 GOOGLE_SHEET_ID（或 SHEET_ID）"})
+            return info
 
-@app.get("/health")
+        # STEP 1: 載入服務帳戶
+        try:
+            sa = _load_sa_info()
+            pk = sa.get("private_key","")
+            info["service_account"] = {
+                "email": sa.get("client_email"),
+                "private_key_head": pk[:30],
+                "private_key_tail": pk[-30:],
+                "private_key_len": len(pk),
+                "private_key_has_begin": pk.startswith("-----BEGIN PRIVATE KEY-----"),
+                "private_key_has_end": pk.endswith("-----END PRIVATE KEY-----"),
+            }
+            info["steps"].append({"step": "LOAD_SA", "ok": True})
+        except Exception as e:
+            info["steps"].append({"step": "LOAD_SA", "ok": False, "exc": type(e).__name__, "msg": str(e)})
+            return info
+
+        # STEP 2: 建立 gspread client
+        try:
+            gc = _gspread_client()
+            info["steps"].append({"step": "GSPREAD_CLIENT", "ok": True})
+        except Exception as e:
+            info["steps"].append({"step": "GSPREAD_CLIENT", "ok": False, "exc": type(e).__name__, "msg": str(e)})
+            return info
+
+        sheet_id = info["env"]["GOOGLE_SHEET_ID"]
+        if not sheet_id:
+            info["steps"].append({"step": "ENV_SHEET_ID", "ok": False, "hint": "缺少 GOOGLE_SHEET_ID（或 SHEET_ID）"})
+            return info
+
+        # STEP 3: open_by_key（讀權）
+        try:
+            sh = gc.open_by_key(sheet_id)
+            info["title"] = sh.title
+            info["worksheets"] = [ws.title for ws in sh.worksheets()]
+            info["steps"].append({"step": "OPEN_BY_KEY", "ok": True})
+        except Exception as e:
+            # 常見：SpreadsheetNotFound（ID 錯，或沒分享給服務帳戶）
+            info["steps"].append({
+                "step": "OPEN_BY_KEY", "ok": False,
+                "exc": type(e).__name__, "msg": str(e),
+                "hint": "若是 SpreadsheetNotFound：1) 檢查 ID 是否正確；2) 將此試算表分享給服務帳戶（可編輯）；3) 若在 Shared Drive，需加入該硬碟並給權限。"
+            })
+            return info
+
+        # STEP 4: 檢查/建立 users 與 checkin_log（寫權）
+        try:
+            try:
+                ws_users = sh.worksheet("users")
+            except Exception:
+                ws_users = sh.add_worksheet(title="users", rows=1000, cols=3)
+                ws_users.update("A1:C1", [["name","user_id","updated_at"]])
+
+            try:
+                ws_log = sh.worksheet("checkin_log")
+            except Exception:
+                ws_log = sh.add_worksheet(title="checkin_log", rows=20000, cols=4)
+                ws_log.update("A1:D1", [["date","name","when","user_id"]])
+
+            # 寫入一列測試（不污染正式數據）
+            ts = _now_local().isoformat()
+            ws_users.append_row(["__diag__", "__WRITE_TEST__", ts], value_input_option="RAW")
+            info["steps"].append({"step": "WRITE_TEST_USERS", "ok": True})
+            # 清理剛寫入的測試列（若失敗也僅影響清潔）
+            try:
+                recs = ws_users.get_all_records()
+                if recs and recs[-1].get("name") == "__diag__":
+                    last_row = len(recs) + 1
+                    ws_users.delete_rows(last_row)
+            except Exception:
+                pass
+
+            info["ok"] = True
+            return info
+
+        except Exception as e:
+            # 常見：PermissionError / APIError 403（只有檢視權，未授予編輯）
+            hint = (
+                "權限不足：請把試算表分享給服務帳戶（可編輯）"
+                f"：{info['service_account'].get('email','<service-account>')}。"
+                "若檔案在 Shared Drive，需將服務帳戶加入該硬碟並給『內容管理員/編輯者』。"
+                "組織網域若限制外部成員，請放到 My Drive 或請管理員開放。"
+            )
+            info["steps"].append({"step": "WRITE_TEST_USERS", "ok": False, "exc": type(e).__name__, "msg": str(e), "hint": hint})
+            return info
+
+    except Exception as e:
+        info["steps"].append({"step": "FATAL", "ok": False, "exc": type(e).__name__, "msg": str(e)})
+        return info
+
+# ---------- Routes ----------
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"status": "ok", "service": "facecheck-backend", "tz": TZ_NAME, "sheets": USE_SHEETS}), 200
+
+@app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
 
-# 新增：GET /webhook（診斷用）
-@app.get("/webhook")
-def webhook_debug_get():
-    return "Webhook endpoint is alive (GET). Use POST for LINE.", 200
-
-@app.post("/webhook")
-def webhook():
-    """
-    重要：任何錯誤都回 200，避免 LINE 持續重試造成風暴。
-    無效簽章也回 200，但記 log。
-    """
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        app.logger.exception("Invalid signature on /webhook")
-    except Exception:
-        app.logger.exception("Exception on /webhook")
-    return "OK", 200
-
-@app.get("/users")
+@app.route("/users", methods=["GET"])
 def route_users():
     return jsonify(load_users()), 200
 
-@app.get("/debug/sheets")
+@app.route("/debug/sheets", methods=["GET"])
 def debug_sheets():
-    return jsonify(_probe_sheet()), 200
+    # 以【讀】為主的簡表，避免在權限不足時又做額外操作
+    base = {"USE_SHEETS": USE_SHEETS, "tz": TZ_NAME}
+    try:
+        if USE_SHEETS:
+            sa = _load_sa_info()
+            base.update({
+                "service_account_email": sa.get("client_email"),
+                "sheet_id": os.environ.get("GOOGLE_SHEET_ID") or os.environ.get("SHEET_ID"),
+                "private_key_head": sa.get("private_key","")[:30],
+                "private_key_tail": sa.get("private_key","")[-30:],
+                "private_key_len": len(sa.get("private_key","")),
+                "private_key_has_begin": sa.get("private_key","").startswith("-----BEGIN PRIVATE KEY-----"),
+                "private_key_has_end": sa.get("private_key","").endswith("-----END PRIVATE KEY-----"),
+            })
+            try:
+                gc = _gspread_client()
+                sh = gc.open_by_key(base["sheet_id"])
+                base["title"] = sh.title
+                base["worksheets"] = [ws.title for ws in sh.worksheets()]
+                base["ok"] = True
+            except Exception as e:
+                base["error"] = str(e)
+        else:
+            base["hint"] = "USE_SHEETS=False：檢查 GOOGLE_SERVICE_ACCOUNT_* 與 GOOGLE_SHEET_ID（或 SHEET_ID）"
+    except Exception as e:
+        base["error"] = str(e)
+    return jsonify(base), 200
 
-@app.get("/debug/sheets/write")
+@app.route("/debug/sheets/write", methods=["GET"])
 def debug_sheets_write():
     """實際寫入一列，驗證服務帳戶是否有『編輯』權限 & 指定分頁存在。"""
     try:
         if not USE_SHEETS:
             return jsonify(ok=False, error="USE_SHEETS_FALSE",
                            message="未啟用 Sheets。請設定 GOOGLE_SERVICE_ACCOUNT_* 與 GOOGLE_SHEET_ID（或 SHEET_ID）。"), 400
+        # 寫 users（upsert）
         sheets_upsert_user("測試用名字", "TEST_USER_ID")
+        # 寫 checkin_log
         sheets_mark_checkin("測試用名字", _now_local().isoformat(), "TEST_USER_ID")
         return jsonify(ok=True), 200
     except GspreadAPIError as ge:
         code = getattr(getattr(ge, "response", None), "status_code", None)
         msg  = str(ge)
         hint = None
-        if code == 403 or "PERMISSION" in msg.upper():
+        if code == 403 or "PERMISSION" in (msg or "").upper():
             hint = "權限不足：請把試算表分享給服務帳戶（可編輯）：{}".format(
                 (_sa_info_cache or {}).get("client_email", "<service-account-email>")
             )
@@ -500,7 +628,50 @@ def debug_sheets_write():
     except Exception as e:
         return jsonify(ok=False, error=type(e).__name__, message=str(e)), 500
 
-@app.get("/push")
+@app.route("/debug/sheets/diag", methods=["GET"])
+def debug_sheets_diag():
+    """完整分步診斷（讀 + 寫），回傳每一步結果與 HINT。"""
+    return jsonify(_check_sheet_access()), 200
+
+@app.route("/admin/unchecked_preview", methods=["GET"])
+def admin_unchecked_preview():
+    try:
+        data = load_users()
+        n2u = data["name_to_uid"]
+        unchecked = list_unchecked_names()
+        return jsonify({
+            "date": _today_str(),
+            "count": len(unchecked),
+            "unchecked": unchecked,
+            "mapped": {name: n2u.get(name) for name in unchecked}
+        }), 200
+    except Exception as e:
+        return jsonify({"error": type(e).__name__, "message": str(e)}), 500
+
+# 方便 Render 健康檢查：GET /webhook 直接 200（不觸發處理）
+@app.route("/webhook", methods=["GET"])
+def webhook_debug_get():
+    return "OK", 200
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    """
+    重要：任何錯誤都回 200，避免 LINE 推播端持續重試造成風暴。
+    無效簽章的情況改記 log 並回 200。
+    """
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        app.logger.exception("Invalid signature on /webhook")
+        return "OK", 200
+    except Exception:
+        app.logger.exception("Exception on /webhook")
+        return "OK", 200
+    return "OK", 200
+
+@app.route("/push", methods=["GET"])
 def push_to_name():
     name = (request.args.get("name") or "").strip()
     text = (request.args.get("text") or "測試訊息").strip()
@@ -514,7 +685,7 @@ def push_to_name():
     except ApiException as e:
         return f"Push 失敗 status={getattr(e,'status',None)}, body={getattr(e,'body',None)}", 500
 
-@app.post("/checkin")
+@app.route("/checkin", methods=["POST"])
 def checkin():
     if request.headers.get("X-API-KEY") != API_KEY:
         return jsonify({"error":"unauthorized"}), 401
@@ -550,7 +721,7 @@ def checkin():
     except ApiException as e:
         return jsonify({"status":"line_error","detail":getattr(e,'body',None)}), 502
 
-@app.post("/cron/morning_scan")
+@app.route("/cron/morning_scan", methods=["POST"])
 def cron_morning_scan():
     if request.headers.get("X-API-KEY") != API_KEY:
         return jsonify({"error":"unauthorized"}), 401
@@ -578,40 +749,6 @@ def cron_morning_scan():
         except ApiException:
             pass
     return jsonify({"status":"ok","reminded":count,"unchecked":unchecked}), 200
-
-# ---------- Debug：檢查 Sheets 連線（含私鑰健檢結果） ----------
-def _probe_sheet():
-    info = {"USE_SHEETS": USE_SHEETS, "tz": TZ_NAME}
-    try:
-        if USE_SHEETS:
-            sa = _load_sa_info()  # 會丟出詳細錯誤
-            info["service_account_email"] = sa.get("client_email")
-            info["sheet_id"] = os.environ.get("GOOGLE_SHEET_ID") or os.environ.get("SHEET_ID")
-            info["private_key_head"] = sa.get("private_key","")[:30]
-            info["private_key_tail"] = sa.get("private_key","")[-30:]
-            info["private_key_len"]  = len(sa.get("private_key",""))
-            info["private_key_has_begin"] = sa.get("private_key","").startswith("-----BEGIN PRIVATE KEY-----")
-            info["private_key_has_end"]   = sa.get("private_key","").endswith("-----END PRIVATE KEY-----")
-            gc = _gspread_client()
-            sh = gc.open_by_key(info["sheet_id"])
-            info["title"] = sh.title
-            info["worksheets"] = [ws.title for ws in sh.worksheets()]
-            try:
-                u = sh.worksheet("users")
-                info["users_rows"] = len(u.get_all_records())
-            except Exception as e:
-                info["users_error"] = str(e)
-            try:
-                c = sh.worksheet("checkin_log")
-                info["checkin_log_rows"] = len(c.get_all_records())
-            except Exception as e:
-                info["checkin_log_error"] = str(e)
-            info["ok"] = True
-        else:
-            info["hint"] = _gs_reason or "USE_SHEETS=False：檢查 GOOGLE_SERVICE_ACCOUNT_* 與 GOOGLE_SHEET_ID（或 SHEET_ID）"
-    except Exception as e:
-        info["error"] = str(e)
-    return info
 
 # ---------- 事件處理 ----------
 @handler.add(MessageEvent, message=TextMessageContent)
@@ -646,21 +783,22 @@ def handle_text(event):
                 code = getattr(getattr(ge, "response", None), "status_code", None)
                 msg  = str(ge)
                 hint = None
-                if code == 403 or "PERMISSION" in msg.upper():
+                if code == 403 or "PERMISSION" in (msg or "").upper():
                     hint = "權限不足：請把試算表分享給服務帳戶（可編輯）：{}".format(
                         (_sa_info_cache or {}).get("client_email", "<service-account-email>")
                     )
                 print("[BIND][ERROR] GspreadAPIError", code, msg, "| hint:", hint)
                 reply_text = "綁定失敗：後端寫入試算表權限不足，請稍後再試或通知管理員。"
             except Exception as e:
-                diag = ""
+                # 更清楚的例外輸出：例外型別 + 訊息 + 私鑰健檢摘要
+                diag = f" | EXC={type(e).__name__}: {e}"
                 try:
                     sa = _load_sa_info()
                     pk = sa.get("private_key","")
-                    diag = f" | pk_begin={pk.startswith('-----BEGIN PRIVATE KEY-----')} pk_end={pk.endswith('-----END PRIVATE KEY-----')} pk_len={len(pk)}"
+                    diag += f" | pk_begin={pk.startswith('-----BEGIN PRIVATE KEY-----')} pk_end={pk.endswith('-----END PRIVATE KEY-----')} pk_len={len(pk)}"
                 except Exception as ee:
-                    diag = f" | SA_LOAD_ERROR={ee}"
-                print("[BIND][ERROR]", e, diag)
+                    diag += f" | SA_LOAD_ERROR={ee}"
+                print("[BIND][ERROR]", diag)
                 reply_text = "綁定失敗：後端服務暫時無法連線，稍後再試。"
         else:
             reply_text = '❌ 請輸入格式：連結 你的名字'
@@ -688,13 +826,17 @@ def handle_text(event):
 def create_app():
     return app
 
-# 讓 gunicorn 可 import 到 app
+# 讓 gunicorn 可 import 到 app（gunicorn 指令： gunicorn app:app）
 app = create_app()
 
-# 啟動時列出所有路由（方便 Render Log 確認 /webhook 是否掛上）
-print("[ROUTES] url_map =", app.url_map)
-for r in app.url_map.iter_rules():
-    print("[ROUTE]", r.rule, "methods=", sorted(r.methods))
+# ---------- 啟動時列出路由（方便 Render log 檢查） ----------
+def _print_routes(_app: Flask):
+    print("[ROUTES] url_map =", _app.url_map)
+    for r in _app.url_map.iter_rules():
+        print(f"[ROUTE] {r.rule} methods= {sorted(list(r.methods))}")
+
+_print_routes(app)
+print("[CONFIG] USE_SHEETS =", USE_SHEETS, "| TZ =", TZ_NAME, "| REASON:", _gs_reason or "OK")
 
 # ---------- 本機進入點 ----------
 if __name__ == "__main__":
