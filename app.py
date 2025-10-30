@@ -12,7 +12,7 @@
 - GET /health：健康檢查
 
 需求套件：
-Flask, line-bot-sdk (v3), gspread, oauth2client, python-dotenv, requests, (標準庫 zoneinfo)
+Flask, line-bot-sdk (v3), gspread, google-auth, python-dotenv, requests, (標準庫 zoneinfo)
 
 必要環境變數：
 CHANNEL_ACCESS_TOKEN, CHANNEL_SECRET
@@ -209,21 +209,35 @@ def _fs_save_users(data):
 
 # ---------- Google Sheets 介面 ----------
 USE_SHEETS = False
+_gs_reason = None
 try:
     import gspread
-    from oauth2client.service_account import ServiceAccountCredentials
-    _sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    _sheet_id = os.environ.get("GOOGLE_SHEET_ID", "").strip()
+    from google.oauth2.service_account import Credentials  # 新：google-auth
+    _sa_json = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
+    _sheet_id = (os.environ.get("GOOGLE_SHEET_ID") or "").strip()
     if _sa_json and _sheet_id:
         USE_SHEETS = True
+    else:
+        _gs_reason = "缺少 GOOGLE_SERVICE_ACCOUNT_JSON 或 GOOGLE_SHEET_ID"
 except Exception as e:
-    print("[SHEETS][WARN] 套件未備或環境未設，將使用本地 users.json：", e)
+    _gs_reason = f"套件未備或匯入失敗：{e}"
+    print("[SHEETS][WARN]", _gs_reason)
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 def _gspread_client():
+    """
+    從環境變數 GOOGLE_SERVICE_ACCOUNT_JSON 讀取整份 JSON。
+    關鍵：把字面上的 \\n 還原成真正換行，避免私鑰被解析失敗。
+    """
     sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
     creds_dict = json.loads(sa_json)
-    scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    if "private_key" in creds_dict:
+        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
 
 def _open_sheet(sheet_name):
@@ -295,7 +309,7 @@ API_KEY              = (os.environ.get("API_KEY") or "").strip()
 
 print("[CONFIG] SECRET len =", _safe_len(CHANNEL_SECRET), "value:", _mask(CHANNEL_SECRET))
 print("[CONFIG] TOKEN  len =", _safe_len(CHANNEL_ACCESS_TOKEN), "value:", _mask(CHANNEL_ACCESS_TOKEN))
-print("[CONFIG] USE_SHEETS =", USE_SHEETS, "| TZ =", TZ_NAME)
+print("[CONFIG] USE_SHEETS =", USE_SHEETS, "| TZ =", TZ_NAME, "| REASON:", _gs_reason or "OK")
 
 if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
     print("[HINT] 檢查：1) 環境變數是否已設；2) 值是否無多餘空白/引號/Bearer")
@@ -387,12 +401,20 @@ def route_users():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    """
+    重要：任何錯誤都回 200，避免 LINE 推播端持續重試造成風暴。
+    無效簽章的情況改記 log 並回 200。
+    """
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        abort(400)
+        app.logger.exception("Invalid signature on /webhook")
+        return "OK", 200
+    except Exception:
+        app.logger.exception("Exception on /webhook")
+        return "OK", 200
     return "OK", 200
 
 @app.route("/push", methods=["GET"])
@@ -482,7 +504,6 @@ def _probe_sheet():
             sa = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
             info["service_account_email"] = sa.get("client_email")
             info["sheet_id"] = os.environ.get("GOOGLE_SHEET_ID")
-            import gspread
             gc = _gspread_client()
             sh = gc.open_by_key(info["sheet_id"])
             info["title"] = sh.title
@@ -527,15 +548,19 @@ def handle_text(event):
     elif text.startswith("連結 "):
         new_name = text[3:].strip()
         if new_name and user_id:
-            upsert_user(new_name, user_id)
-            confirm = f"已綁定：{new_name} ✅\n你的 userId 是：{user_id}"
-            reply_text = "綁定成功！已傳送確認訊息至你的 LINE。"
             try:
-                line_push(user_id, confirm)
-                print(f"[LINE] Push 綁定確認 → {user_id}: {confirm}")
-            except ApiException as e_push:
-                print("[LINE][ERROR][push-confirm]", getattr(e_push,"status",None), getattr(e_push,"body",None))
-                reply_text = confirm
+                upsert_user(new_name, user_id)
+                confirm = f"已綁定：{new_name} ✅\n你的 userId 是：{user_id}"
+                reply_text = "綁定成功！已傳送確認訊息至你的 LINE。"
+                try:
+                    line_push(user_id, confirm)
+                    print(f"[LINE] Push 綁定確認 → {user_id}: {confirm}")
+                except ApiException as e_push:
+                    print("[LINE][ERROR][push-confirm]", getattr(e_push,"status",None), getattr(e_push,"body",None))
+                    reply_text = confirm
+            except Exception as e:
+                print("[BIND][ERROR]", e)
+                reply_text = "綁定失敗：後端服務暫時無法連線，稍後再試。"
         else:
             reply_text = '❌ 請輸入格式：連結 你的名字'
 
