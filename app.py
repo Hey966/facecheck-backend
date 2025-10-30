@@ -8,22 +8,25 @@
 - POST /checkin：本機回報簽到（X-API-KEY），後端判斷當日去重與遲到，再推播
 - POST /cron/morning_scan：平日 08:00 未簽到提醒（X-API-KEY）
 - GET /push?name=...&text=...：測試推播
-- GET /debug/sheets：檢查 Google 試算表連線/分頁狀態
+- GET /debug/sheets：檢查 Google 試算表連線/分頁狀態（含服務帳戶健檢）
 - GET /health：健康檢查
 
 需求套件：
-Flask, line-bot-sdk (v3), gspread, google-auth, python-dotenv, requests, (標準庫 zoneinfo)
+Flask, line-bot-sdk (v3), gspread, google-auth, python-dotenv, requests
 
 必要環境變數：
 CHANNEL_ACCESS_TOKEN, CHANNEL_SECRET
-可選（啟用 Sheets 模式）：
-GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_SHEET_ID
+可選（啟用 Sheets 模式，擇一或多個來源）：
+GOOGLE_SERVICE_ACCOUNT_JSON（整份 JSON）
+GOOGLE_SERVICE_ACCOUNT_FILE（容器內檔案路徑）
+GOOGLE_SERVICE_ACCOUNT_B64（整份 JSON 的 base64）
+另需：GOOGLE_SHEET_ID
 其他：
 API_KEY, TZ=Asia/Taipei, LATE_CUTOFF=08:00, ONLY_WEEKDAYS=1
 START_NGROK=1（本機開發）
 """
 
-import os, json, atexit, subprocess, time, requests, shutil, datetime
+import os, json, atexit, subprocess, time, requests, shutil, datetime, base64, textwrap
 from pathlib import Path
 from urllib.parse import urljoin
 from flask import Flask, request, abort, jsonify
@@ -82,11 +85,6 @@ def _parse_hhmm(s):
         return 8, 0
 
 def _parse_when_to_local(when_iso: str) -> datetime.datetime:
-    """
-    允許傳進來：
-      - 帶時區的 ISO（e.g., 2025-10-30T08:12:00+08:00）→ 轉換到 TZ
-      - 沒時區（naive）的 ISO → 視為 TZ 下的時間
-    """
     dt = datetime.datetime.fromisoformat(when_iso)
     if dt.tzinfo is None:
         return dt.replace(tzinfo=TZ)
@@ -207,38 +205,103 @@ def _fs_save_users(data):
     except Exception as e:
         print("[USERS][ERROR] 寫入失敗", e); return False
 
-# ---------- Google Sheets 介面 ----------
+# ---------- Google Sheets 介面（強化：多來源載入 + 鍵值健檢 + 自動修復換行） ----------
 USE_SHEETS = False
 _gs_reason = None
+_sa_info_cache = None
+_sa_error_cache = None
+
 try:
     import gspread
-    from google.oauth2.service_account import Credentials  # 新：google-auth
-    _sa_json = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
-    _sheet_id = (os.environ.get("GOOGLE_SHEET_ID") or "").strip()
-    if _sa_json and _sheet_id:
-        USE_SHEETS = True
-    else:
-        _gs_reason = "缺少 GOOGLE_SERVICE_ACCOUNT_JSON 或 GOOGLE_SHEET_ID"
+    from google.oauth2.service_account import Credentials  # 使用 google-auth
 except Exception as e:
-    _gs_reason = f"套件未備或匯入失敗：{e}"
-    print("[SHEETS][WARN]", _gs_reason)
+    _gs_reason = f"套件未備：{e}"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
+def _load_sa_info():
+    """
+    從三種來源取服務帳戶 JSON：
+      1) GOOGLE_SERVICE_ACCOUNT_JSON（整份 JSON）
+      2) GOOGLE_SERVICE_ACCOUNT_FILE（容器內檔案路徑）
+      3) GOOGLE_SERVICE_ACCOUNT_B64（整份 JSON 的 base64）
+    並修復 private_key 的換行、做嚴格健檢，回傳 dict。
+    """
+    global _sa_info_cache, _sa_error_cache
+    if _sa_info_cache is not None or _sa_error_cache is not None:
+        if _sa_info_cache is not None:
+            return _sa_info_cache
+        raise RuntimeError(_sa_error_cache)
+
+    raw_json = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
+    file_path = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE") or "").strip()
+    b64_blob = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_B64") or "").strip()
+
+    info = None
+    source = None
+    try:
+        if raw_json:
+            info = json.loads(raw_json)
+            source = "JSON"
+        elif file_path:
+            with open(file_path, "r", encoding="utf-8") as f:
+                info = json.load(f)
+            source = "FILE"
+        elif b64_blob:
+            raw = base64.b64decode(b64_blob).decode("utf-8")
+            info = json.loads(raw)
+            source = "B64"
+        else:
+            raise RuntimeError("缺少服務帳戶來源（未設定 GOOGLE_SERVICE_ACCOUNT_JSON / FILE / B64）")
+
+        # 修復與健檢 private_key
+        pk = info.get("private_key", "")
+        # 還原字面 \r\n / \n
+        pk = pk.replace("\\r\\n", "\n").replace("\\n", "\n")
+        # 去除左右空白與 Windows \r
+        pk = pk.strip().replace("\r\n", "\n").replace("\r", "\n")
+        info["private_key"] = pk
+
+        header_ok = pk.startswith("-----BEGIN PRIVATE KEY-----")
+        footer_ok = pk.endswith("-----END PRIVATE KEY-----")
+        line_count = pk.count("\n") + 1
+        size_ok = len(pk) > 1000  # 常見長度 > 1600 字元；1000 做下限
+
+        if not (header_ok and footer_ok and size_ok):
+            raise RuntimeError(
+                "服務帳戶私鑰格式錯誤："
+                f"header={header_ok} footer={footer_ok} size_ok={size_ok} lines={line_count}"
+            )
+
+        _sa_info_cache = info
+        print(f"[SA] Loaded from {source}: client_email={info.get('client_email')} key_len={len(pk)} lines={line_count}")
+        return info
+    except Exception as e:
+        _sa_error_cache = f"服務帳戶讀取失敗（source={source}）：{e}"
+        raise
+
 def _gspread_client():
-    """
-    從環境變數 GOOGLE_SERVICE_ACCOUNT_JSON 讀取整份 JSON。
-    關鍵：把字面上的 \\n 還原成真正換行，避免私鑰被解析失敗。
-    """
-    sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-    creds_dict = json.loads(sa_json)
-    if "private_key" in creds_dict:
-        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    info = _load_sa_info()
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
+
+# 啟用 Sheets 與否：同時需要 SA 與 SHEET_ID
+_sheet_id = (os.environ.get("GOOGLE_SHEET_ID") or "").strip()
+if _sheet_id:
+    try:
+        _ = _load_sa_info()  # 試讀一次，能提早報錯
+        USE_SHEETS = True
+        _gs_reason = "OK"
+    except Exception as e:
+        USE_SHEETS = False
+        _gs_reason = str(e)
+else:
+    USE_SHEETS = False
+    if _gs_reason is None:
+        _gs_reason = "缺少 GOOGLE_SHEET_ID"
 
 def _open_sheet(sheet_name):
     gc = _gspread_client()
@@ -496,14 +559,19 @@ def cron_morning_scan():
             pass
     return jsonify({"status":"ok","reminded":count,"unchecked":unchecked}), 200
 
-# ---------- Debug：檢查 Sheets 連線 ----------
+# ---------- Debug：檢查 Sheets 連線（含私鑰健檢結果） ----------
 def _probe_sheet():
     info = {"USE_SHEETS": USE_SHEETS, "tz": TZ_NAME}
     try:
         if USE_SHEETS:
-            sa = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+            sa = _load_sa_info()  # 會丟出詳細錯誤
             info["service_account_email"] = sa.get("client_email")
             info["sheet_id"] = os.environ.get("GOOGLE_SHEET_ID")
+            info["private_key_head"] = sa.get("private_key","")[:30]
+            info["private_key_tail"] = sa.get("private_key","")[-30:]
+            info["private_key_len"]  = len(sa.get("private_key",""))
+            info["private_key_has_begin"] = sa.get("private_key","").startswith("-----BEGIN PRIVATE KEY-----")
+            info["private_key_has_end"]   = sa.get("private_key","").endswith("-----END PRIVATE KEY-----")
             gc = _gspread_client()
             sh = gc.open_by_key(info["sheet_id"])
             info["title"] = sh.title
@@ -520,7 +588,7 @@ def _probe_sheet():
                 info["checkin_log_error"] = str(e)
             info["ok"] = True
         else:
-            info["hint"] = "USE_SHEETS=False：檢查 GOOGLE_SERVICE_ACCOUNT_JSON / GOOGLE_SHEET_ID"
+            info["hint"] = _gs_reason or "USE_SHEETS=False：檢查 GOOGLE_SERVICE_ACCOUNT_* 與 GOOGLE_SHEET_ID"
     except Exception as e:
         info["error"] = str(e)
     return info
@@ -559,7 +627,16 @@ def handle_text(event):
                     print("[LINE][ERROR][push-confirm]", getattr(e_push,"status",None), getattr(e_push,"body",None))
                     reply_text = confirm
             except Exception as e:
-                print("[BIND][ERROR]", e)
+                # 這裡會捕捉到像 "Short substrate on input" 之類的錯，
+                # 現在我們會把更可讀的診斷一起印出，方便你在 Render log 直接看到重點。
+                diag = ""
+                try:
+                    sa = _load_sa_info()
+                    pk = sa.get("private_key","")
+                    diag = f" | pk_begin={pk.startswith('-----BEGIN PRIVATE KEY-----')} pk_end={pk.endswith('-----END PRIVATE KEY-----')} pk_len={len(pk)}"
+                except Exception as ee:
+                    diag = f" | SA_LOAD_ERROR={ee}"
+                print("[BIND][ERROR]", e, diag)
                 reply_text = "綁定失敗：後端服務暫時無法連線，稍後再試。"
         else:
             reply_text = '❌ 請輸入格式：連結 你的名字'
