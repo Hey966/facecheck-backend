@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-進階班 LINE 推播後端（Flask + Google 試算表，完整檔案版）
+進階班 LINE 推播後端（Flask + Google 試算表，完整檔案版＋診斷強化）
 
 功能：
 - Webhook：處理「連結 <姓名>」→ 寫入 users 工作表（或本地 users.json）
@@ -10,26 +10,19 @@
 - GET /push?name=...&text=...：測試推播
 - GET /debug/sheets：檢查 Google 試算表連線/分頁狀態（含服務帳戶健檢）
 - GET /debug/sheets/write：實際寫入一列驗證「可寫入」
+- GET /webhook：診斷路由是否存在（LINE 仍走 POST）
 - GET /health：健康檢查
 
 需求套件：
 Flask, line-bot-sdk (v3), gspread, google-auth, python-dotenv, requests
-
-必要環境變數：
-CHANNEL_ACCESS_TOKEN, CHANNEL_SECRET
-可選（啟用 Sheets 模式，擇一或多個來源）：
-GOOGLE_SERVICE_ACCOUNT_JSON / GOOGLE_SERVICE_ACCOUNT_FILE / GOOGLE_SERVICE_ACCOUNT_B64
-（支援舊名：SERVICE_ACCOUNT_JSON_B64）
-另需：GOOGLE_SHEET_ID（支援舊名：SHEET_ID）
-其他：
-API_KEY, TZ=Asia/Taipei, LATE_CUTOFF=08:00, ONLY_WEEKDAYS=1
-START_NGROK=1（僅本機開發）
 """
 
-import os, json, atexit, subprocess, time, requests, shutil, datetime, base64, textwrap
+import os, json, atexit, subprocess, time, requests, shutil, datetime, base64
 from pathlib import Path
 from urllib.parse import urljoin
-from flask import Flask, request, abort, jsonify
+from flask import Flask, request, jsonify
+
+print("[BOOT] facecheck-backend FULL + diagnostics (GET /webhook, route listing)")
 
 # ---------- 以此檔所在資料夾為工作目錄 ----------
 BASE_DIR = Path(__file__).resolve().parent
@@ -448,32 +441,51 @@ def line_push(user_id, text):
         )
 
 # ---------- Routes ----------
-@app.route("/", methods=["GET"])
+@app.get("/")
 def home():
     return jsonify({"status":"ok","service":"facecheck-backend","tz":TZ_NAME,"sheets":USE_SHEETS}), 200
 
-@app.route("/health", methods=["GET"])
+@app.get("/health")
 def health():
     return "OK", 200
 
-@app.route("/users", methods=["GET"])
+# 新增：GET /webhook（診斷用）
+@app.get("/webhook")
+def webhook_debug_get():
+    return "Webhook endpoint is alive (GET). Use POST for LINE.", 200
+
+@app.post("/webhook")
+def webhook():
+    """
+    重要：任何錯誤都回 200，避免 LINE 持續重試造成風暴。
+    無效簽章也回 200，但記 log。
+    """
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        app.logger.exception("Invalid signature on /webhook")
+    except Exception:
+        app.logger.exception("Exception on /webhook")
+    return "OK", 200
+
+@app.get("/users")
 def route_users():
     return jsonify(load_users()), 200
 
-@app.route("/debug/sheets", methods=["GET"])
+@app.get("/debug/sheets")
 def debug_sheets():
     return jsonify(_probe_sheet()), 200
 
-@app.route("/debug/sheets/write", methods=["GET"])
+@app.get("/debug/sheets/write")
 def debug_sheets_write():
     """實際寫入一列，驗證服務帳戶是否有『編輯』權限 & 指定分頁存在。"""
     try:
         if not USE_SHEETS:
             return jsonify(ok=False, error="USE_SHEETS_FALSE",
                            message="未啟用 Sheets。請設定 GOOGLE_SERVICE_ACCOUNT_* 與 GOOGLE_SHEET_ID（或 SHEET_ID）。"), 400
-        # 寫 users（upsert）
         sheets_upsert_user("測試用名字", "TEST_USER_ID")
-        # 寫 checkin_log
         sheets_mark_checkin("測試用名字", _now_local().isoformat(), "TEST_USER_ID")
         return jsonify(ok=True), 200
     except GspreadAPIError as ge:
@@ -488,7 +500,7 @@ def debug_sheets_write():
     except Exception as e:
         return jsonify(ok=False, error=type(e).__name__, message=str(e)), 500
 
-@app.route("/push", methods=["GET"])
+@app.get("/push")
 def push_to_name():
     name = (request.args.get("name") or "").strip()
     text = (request.args.get("text") or "測試訊息").strip()
@@ -502,7 +514,7 @@ def push_to_name():
     except ApiException as e:
         return f"Push 失敗 status={getattr(e,'status',None)}, body={getattr(e,'body',None)}", 500
 
-@app.route("/checkin", methods=["POST"])
+@app.post("/checkin")
 def checkin():
     if request.headers.get("X-API-KEY") != API_KEY:
         return jsonify({"error":"unauthorized"}), 401
@@ -538,7 +550,7 @@ def checkin():
     except ApiException as e:
         return jsonify({"status":"line_error","detail":getattr(e,'body',None)}), 502
 
-@app.route("/cron/morning_scan", methods=["POST"])
+@app.post("/cron/morning_scan")
 def cron_morning_scan():
     if request.headers.get("X-API-KEY") != API_KEY:
         return jsonify({"error":"unauthorized"}), 401
@@ -673,12 +685,16 @@ def handle_text(event):
             print("[LINE][ERROR][push-fallback]", getattr(e2,"status",None), getattr(e2,"body",None))
 
 # ---------- WSGI 入口（雲端用） ----------
-#   Render / gunicorn 指令： gunicorn app:app
 def create_app():
     return app
 
 # 讓 gunicorn 可 import 到 app
 app = create_app()
+
+# 啟動時列出所有路由（方便 Render Log 確認 /webhook 是否掛上）
+print("[ROUTES] url_map =", app.url_map)
+for r in app.url_map.iter_rules():
+    print("[ROUTE]", r.rule, "methods=", sorted(r.methods))
 
 # ---------- 本機進入點 ----------
 if __name__ == "__main__":
