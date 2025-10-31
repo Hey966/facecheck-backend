@@ -16,16 +16,6 @@
 
 需求套件：
 Flask, line-bot-sdk (v3), gspread, google-auth, python-dotenv, requests
-
-必要環境變數：
-CHANNEL_ACCESS_TOKEN, CHANNEL_SECRET
-可選（啟用 Sheets 模式，擇一或多個來源）：
-GOOGLE_SERVICE_ACCOUNT_JSON / GOOGLE_SERVICE_ACCOUNT_FILE / GOOGLE_SERVICE_ACCOUNT_B64
-（支援舊名：SERVICE_ACCOUNT_JSON_B64）
-另需：GOOGLE_SHEET_ID（支援舊名：SHEET_ID）
-其他：
-API_KEY, TZ=Asia/Taipei, LATE_CUTOFF=08:00, ONLY_WEEKDAYS=1
-START_NGROK=1（僅本機開發）
 """
 
 import os, json, atexit, subprocess, time, requests, shutil, datetime, base64
@@ -70,8 +60,12 @@ except Exception:
     TZ = ZoneInfo("UTC")
     TZ_NAME = "UTC"
 
+def _env_bool(name, default=False):
+    v = str(os.environ.get(name, str(int(default)))).strip().lower()
+    return v in ("1","true","yes","y","on")
+
 LATE_CUTOFF = os.environ.get("LATE_CUTOFF", "08:00")   # "HH:MM"
-ONLY_WEEKDAYS = str(os.environ.get("ONLY_WEEKDAYS", "1")).strip().lower() in ("1","true","yes","y","on")
+ONLY_WEEKDAYS = _env_bool("ONLY_WEEKDAYS", True)
 
 def _now_local():
     return datetime.datetime.now(TZ)
@@ -99,7 +93,6 @@ from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, PushMessageRequest, TextMessage
 )
-from linebot.v3.exceptions import InvalidSignatureError
 try:
     from linebot.v3.messaging.exceptions import ApiException
 except Exception:
@@ -109,10 +102,6 @@ except Exception:
         ApiException = Exception
 
 # ---------- 自動啟動 ngrok（本機開發用） ----------
-def _env_bool(name, default=False):
-    v = os.environ.get(name, str(int(default))).strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
-
 def _find_ngrok_exe():
     p = (os.environ.get("NGROK") or "").strip().strip('"')
     if p and os.path.isfile(p): return p
@@ -159,14 +148,8 @@ def start_ngrok_if_needed(local_host="127.0.0.1", port=5000, webhook_path="/webh
     if not exe:
         print("[NGROK][ERROR] 找不到 ngrok，可在 .env 設 NGROK=完整路徑")
         return None
-    region = (os.environ.get("NGROK_REGION") or "").strip() or None
-    extra  = (os.environ.get("NGROK_ARGS") or "").strip() or None
-
     _kill_ngrok_silent()
     cmd = [exe, "http", f"http://{local_host}:{port}"]
-    if region: cmd += ["--region", region]
-    if extra:  cmd += extra.split()
-
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=creationflags)
     atexit.register(lambda: (proc.poll() is None) and proc.terminate())
@@ -208,7 +191,7 @@ def _fs_save_users(data):
         print("[USERS][ERROR] 寫入失敗", e); return False
 
 # ---------- Google Sheets 介面（多來源載入 + 健檢 + 舊名相容） ----------
-USE_SHEETS = False
+HAS_GSPREAD = True
 _gs_reason = None
 _sa_info_cache = None
 _sa_error_cache = None
@@ -218,7 +201,11 @@ try:
     from google.oauth2.service_account import Credentials  # 使用 google-auth
     from gspread.exceptions import WorksheetNotFound, APIError as GspreadAPIError
 except Exception as e:
+    HAS_GSPREAD = False
     _gs_reason = f"套件未備：{e}"
+    # 讓引用不爆 NameError
+    class WorksheetNotFound(Exception): ...
+    class GspreadAPIError(Exception): ...
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -259,7 +246,6 @@ def _load_sa_info():
         else:
             raise RuntimeError("缺少服務帳戶來源（未設定 GOOGLE_SERVICE_ACCOUNT_JSON / FILE / B64）")
 
-        # 修復與健檢 private_key
         pk = info.get("private_key", "")
         pk = pk.replace("\\r\\n", "\n").replace("\\n", "\n")
         pk = pk.strip().replace("\r\n", "\n").replace("\r", "\n")
@@ -268,7 +254,7 @@ def _load_sa_info():
         header_ok = pk.startswith("-----BEGIN PRIVATE KEY-----")
         footer_ok = pk.endswith("-----END PRIVATE KEY-----")
         line_count = pk.count("\n") + 1
-        size_ok = len(pk) > 1000  # 常見長度 >1600，1000 做下限
+        size_ok = len(pk) > 1000
 
         if not (header_ok and footer_ok and size_ok):
             raise RuntimeError(
@@ -288,20 +274,45 @@ def _gspread_client():
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
 
-# 啟用 Sheets 與否：同時需要 SA 與 SHEET_ID（支援舊名）
+# ---- 判定 USE_SHEETS（支援 env 強制覆寫） ----
 _sheet_id = (os.environ.get("GOOGLE_SHEET_ID") or os.environ.get("SHEET_ID") or "").strip()
-if _sheet_id:
-    try:
-        _ = _load_sa_info()  # 試讀一次，能提早報錯
-        USE_SHEETS = True
-        _gs_reason = "OK"
-    except Exception as e:
+USE_SHEETS_ENV = os.environ.get("USE_SHEETS")  # 允許使用者顯式覆寫
+USE_SHEETS = False
+_use_reason = ""
+
+if USE_SHEETS_ENV is not None:
+    # 使用者用環境變數強制
+    if _env_bool("USE_SHEETS", False):
+        if not HAS_GSPREAD:
+            USE_SHEETS = False
+            _use_reason = _gs_reason or "gspread 未安裝"
+        elif not _sheet_id:
+            USE_SHEETS = False
+            _use_reason = "缺少 GOOGLE_SHEET_ID（或 SHEET_ID）"
+        else:
+            try:
+                _ = _load_sa_info()
+                USE_SHEETS = True
+                _use_reason = "env 強制啟用且檢查通過"
+            except Exception as e:
+                USE_SHEETS = False
+                _use_reason = f"env 強制但服務帳戶失敗：{e}"
+    else:
         USE_SHEETS = False
-        _gs_reason = str(e)
+        _use_reason = "env 明確關閉"
 else:
-    USE_SHEETS = False
-    if _gs_reason is None:
-        _gs_reason = "缺少 GOOGLE_SHEET_ID（或 SHEET_ID）"
+    # 自動判定
+    if HAS_GSPREAD and _sheet_id:
+        try:
+            _ = _load_sa_info()
+            USE_SHEETS = True
+            _use_reason = "自動啟用（gspread+sheet_id+SA OK）"
+        except Exception as e:
+            USE_SHEETS = False
+            _use_reason = f"服務帳戶失敗：{e}"
+    else:
+        USE_SHEETS = False
+        _use_reason = _gs_reason or "缺少 sheet_id"
 
 def _open_sheet(sheet_name):
     gc = _gspread_client()
@@ -372,7 +383,7 @@ API_KEY              = (os.environ.get("API_KEY") or "").strip()
 
 print("[CONFIG] SECRET len =", _safe_len(CHANNEL_SECRET), "value:", _mask(CHANNEL_SECRET))
 print("[CONFIG] TOKEN  len =", _safe_len(CHANNEL_ACCESS_TOKEN), "value:", _mask(CHANNEL_ACCESS_TOKEN))
-print("[CONFIG] USE_SHEETS =", USE_SHEETS, "| TZ =", TZ_NAME, "| REASON:", _gs_reason or "OK")
+print("[CONFIG] USE_SHEETS =", USE_SHEETS, "| REASON:", _use_reason, "| TZ =", TZ_NAME)
 
 if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
     print("[HINT] 檢查：1) 環境變數是否已設；2) 值是否無多餘空白/引號/Bearer")
@@ -451,24 +462,22 @@ def line_push(user_id, text):
 
 # ---------- Debug：分步診斷 / 讀寫驗證 ----------
 def _check_sheet_access():
-    """
-    分步診斷 Google Sheet 開啟/寫入權限。
-    回傳 dict：包含每一步結果、清楚的 HINT，以及捕捉到的例外型別/訊息。
-    """
     info = {
         "tz": TZ_NAME,
         "env": {
             "USE_SHEETS": USE_SHEETS,
             "GOOGLE_SHEET_ID": (os.environ.get("GOOGLE_SHEET_ID") or os.environ.get("SHEET_ID") or ""),
+            "HAS_GSPREAD": HAS_GSPREAD,
         },
         "service_account": {},
         "steps": [],
         "ok": False,
+        "reason": _use_reason,
     }
     try:
         if not USE_SHEETS:
-            info["steps"].append({"step": "ENV", "ok": False, "detail": "USE_SHEETS=False",
-                                  "hint": "請設定 GOOGLE_SERVICE_ACCOUNT_* 與 GOOGLE_SHEET_ID（或 SHEET_ID）"})
+            info["steps"].append({"step": "ENV", "ok": False, "detail": _use_reason,
+                                  "hint": "請設定 gspread、服務帳戶與 GOOGLE_SHEET_ID，或設 USE_SHEETS=true"})
             return info
 
         # STEP 1: 載入服務帳戶
@@ -508,7 +517,6 @@ def _check_sheet_access():
             info["worksheets"] = [ws.title for ws in sh.worksheets()]
             info["steps"].append({"step": "OPEN_BY_KEY", "ok": True})
         except Exception as e:
-            # 常見：SpreadsheetNotFound（ID 錯，或沒分享給服務帳戶）
             info["steps"].append({
                 "step": "OPEN_BY_KEY", "ok": False,
                 "exc": type(e).__name__, "msg": str(e),
@@ -530,11 +538,9 @@ def _check_sheet_access():
                 ws_log = sh.add_worksheet(title="checkin_log", rows=20000, cols=4)
                 ws_log.update("A1:D1", [["date","name","when","user_id"]])
 
-            # 寫入一列測試（不污染正式數據）
             ts = _now_local().isoformat()
             ws_users.append_row(["__diag__", "__WRITE_TEST__", ts], value_input_option="RAW")
             info["steps"].append({"step": "WRITE_TEST_USERS", "ok": True})
-            # 清理剛寫入的測試列（若失敗也僅影響清潔）
             try:
                 recs = ws_users.get_all_records()
                 if recs and recs[-1].get("name") == "__diag__":
@@ -547,12 +553,10 @@ def _check_sheet_access():
             return info
 
         except Exception as e:
-            # 常見：PermissionError / APIError 403（只有檢視權，未授予編輯）
             hint = (
                 "權限不足：請把試算表分享給服務帳戶（可編輯）"
                 f"：{info['service_account'].get('email','<service-account>')}。"
                 "若檔案在 Shared Drive，需將服務帳戶加入該硬碟並給『內容管理員/編輯者』。"
-                "組織網域若限制外部成員，請放到 My Drive 或請管理員開放。"
             )
             info["steps"].append({"step": "WRITE_TEST_USERS", "ok": False, "exc": type(e).__name__, "msg": str(e), "hint": hint})
             return info
@@ -564,7 +568,7 @@ def _check_sheet_access():
 # ---------- Routes ----------
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "ok", "service": "facecheck-backend", "tz": TZ_NAME, "sheets": USE_SHEETS}), 200
+    return jsonify({"status": "ok", "service": "facecheck-backend", "tz": TZ_NAME, "sheets": USE_SHEETS, "reason": _use_reason}), 200
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -576,8 +580,7 @@ def route_users():
 
 @app.route("/debug/sheets", methods=["GET"])
 def debug_sheets():
-    # 以【讀】為主的簡表，避免在權限不足時又做額外操作
-    base = {"USE_SHEETS": USE_SHEETS, "tz": TZ_NAME}
+    base = {"USE_SHEETS": USE_SHEETS, "tz": TZ_NAME, "reason": _use_reason}
     try:
         if USE_SHEETS:
             sa = _load_sa_info()
@@ -599,38 +602,33 @@ def debug_sheets():
             except Exception as e:
                 base["error"] = str(e)
         else:
-            base["hint"] = "USE_SHEETS=False：檢查 GOOGLE_SERVICE_ACCOUNT_* 與 GOOGLE_SHEET_ID（或 SHEET_ID）"
+            base["hint"] = "USE_SHEETS=False：檢查 gspread/服務帳戶/GOOGLE_SHEET_ID，或設 USE_SHEETS=true"
     except Exception as e:
         base["error"] = str(e)
     return jsonify(base), 200
 
 @app.route("/debug/sheets/write", methods=["GET"])
 def debug_sheets_write():
-    """實際寫入一列，驗證服務帳戶是否有『編輯』權限 & 指定分頁存在。"""
     try:
         if not USE_SHEETS:
             return jsonify(ok=False, error="USE_SHEETS_FALSE",
                            message="未啟用 Sheets。請設定 GOOGLE_SERVICE_ACCOUNT_* 與 GOOGLE_SHEET_ID（或 SHEET_ID）。"), 400
-        # 寫 users（upsert）
         sheets_upsert_user("測試用名字", "TEST_USER_ID")
-        # 寫 checkin_log
         sheets_mark_checkin("測試用名字", _now_local().isoformat(), "TEST_USER_ID")
         return jsonify(ok=True), 200
     except GspreadAPIError as ge:
-        code = getattr(getattr(ge, "response", None), "status_code", None)
         msg  = str(ge)
         hint = None
-        if code == 403 or "PERMISSION" in (msg or "").upper():
+        if "403" in msg or "PERMISSION" in msg.upper():
             hint = "權限不足：請把試算表分享給服務帳戶（可編輯）：{}".format(
                 (_sa_info_cache or {}).get("client_email", "<service-account-email>")
             )
-        return jsonify(ok=False, error="GSPREAD_API_ERROR", code=code, message=msg, hint=hint), 500
+        return jsonify(ok=False, error="GSPREAD_API_ERROR", message=msg, hint=hint), 500
     except Exception as e:
         return jsonify(ok=False, error=type(e).__name__, message=str(e)), 500
 
 @app.route("/debug/sheets/diag", methods=["GET"])
 def debug_sheets_diag():
-    """完整分步診斷（讀 + 寫），回傳每一步結果與 HINT。"""
     return jsonify(_check_sheet_access()), 200
 
 @app.route("/admin/unchecked_preview", methods=["GET"])
@@ -663,10 +661,8 @@ def webhook():
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
-    except InvalidSignatureError:
-        app.logger.exception("Invalid signature on /webhook")
-        return "OK", 200
     except Exception:
+        # 包含 InvalidSignatureError 與其它例外，避免重試風暴
         app.logger.exception("Exception on /webhook")
         return "OK", 200
     return "OK", 200
@@ -780,17 +776,15 @@ def handle_text(event):
                     print("[LINE][ERROR][push-confirm]", getattr(e_push,"status",None), getattr(e_push,"body",None))
                     reply_text = confirm
             except GspreadAPIError as ge:
-                code = getattr(getattr(ge, "response", None), "status_code", None)
                 msg  = str(ge)
                 hint = None
-                if code == 403 or "PERMISSION" in (msg or "").upper():
+                if "403" in msg or "PERMISSION" in msg.upper():
                     hint = "權限不足：請把試算表分享給服務帳戶（可編輯）：{}".format(
                         (_sa_info_cache or {}).get("client_email", "<service-account-email>")
                     )
-                print("[BIND][ERROR] GspreadAPIError", code, msg, "| hint:", hint)
+                print("[BIND][ERROR] GspreadAPIError", msg, "| hint:", hint)
                 reply_text = "綁定失敗：後端寫入試算表權限不足，請稍後再試或通知管理員。"
             except Exception as e:
-                # 更清楚的例外輸出：例外型別 + 訊息 + 私鑰健檢摘要
                 diag = f" | EXC={type(e).__name__}: {e}"
                 try:
                     sa = _load_sa_info()
@@ -826,7 +820,6 @@ def handle_text(event):
 def create_app():
     return app
 
-# 讓 gunicorn 可 import 到 app（gunicorn 指令： gunicorn app:app）
 app = create_app()
 
 # ---------- 啟動時列出路由（方便 Render log 檢查） ----------
@@ -836,13 +829,13 @@ def _print_routes(_app: Flask):
         print(f"[ROUTE] {r.rule} methods= {sorted(list(r.methods))}")
 
 _print_routes(app)
-print("[CONFIG] USE_SHEETS =", USE_SHEETS, "| TZ =", TZ_NAME, "| REASON:", _gs_reason or "OK")
+print("[CONFIG] USE_SHEETS =", USE_SHEETS, "| REASON:", _use_reason, "| TZ =", TZ_NAME)
 
 # ---------- 本機進入點 ----------
 if __name__ == "__main__":
-    public_url = start_ngrok_if_needed(local_host="127.0.0.1", port=PORT, webhook_path="/webhook")
+    public_url = start_ngrok_if_needed(local_host="127.0.0.1", port=int(os.environ.get("PORT", 5000)), webhook_path="/webhook")
     if public_url:
         print("[提示] 到 LINE Developers 貼上：", f"{public_url}/webhook")
         print("      並確保 Use webhook = ON，再按 Verify。")
-    print(f"[FLASK] http://127.0.0.1:{PORT}  /  http://{HOST}:{PORT}")
-    app.run(host=HOST, port=PORT)
+    print(f"[FLASK] http://127.0.0.1:{int(os.environ.get('PORT', 5000))}")
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
